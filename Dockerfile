@@ -8,8 +8,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # Python deps
-COPY pyproject.toml ./
-RUN pip install --no-cache-dir uv && uv pip install --system -r pyproject.toml 2>/dev/null || pip install --no-cache-dir fastapi uvicorn[standard] pydantic-settings psycopg2-binary opensearch-py requests
+COPY requirements.txt ./
+RUN pip install --no-cache-dir -r requirements.txt
 
 # App source
 COPY src/ ./src/
