@@ -53,3 +53,10 @@ pip-wheel-metadata/
 
 # Misc local cache
 .cache/
+
+# Guides
+*_guide.md
+docs/
+
+# Logs
+airflow/logs/
