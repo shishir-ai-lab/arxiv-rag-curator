@@ -56,3 +56,6 @@ pip-wheel-metadata/
 
 # Guides
 *_guide.md
+
+# Logs
+airflow/logs/
