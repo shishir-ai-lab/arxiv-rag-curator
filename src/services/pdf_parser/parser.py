@@ -26,7 +26,7 @@ import time
 from abc import ABC, abstractmethod
 from pathlib import Path
 
-from .schemas import ParsedPaper
+from schemas import ParsedPaper
 
 logger = logging.getLogger(__name__)
 
