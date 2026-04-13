@@ -1,13 +1,13 @@
 """
 PostgreSQL database connection and schema management.
 
-Responsibilities:
-- Connection pooling via psycopg2
-- Schema creation (tables + indexes)
-- Async-ready session factory (SQLAlchemy for future use)
+This version extends the base schema with columns needed for PDF ingestion:
+  - pdf_url:    where to download the paper's PDF
+  - full_text:  Docling-parsed content (Markdown)
+  - pdf_parsed: boolean flag — False means we need to (re)parse
+  - parse_error: error message if parsing failed
 
-Design principle: PostgreSQL is the source of truth. OpenSearch is a
-search-optimised projection. Always write to Postgres first.
+All migrations use IF NOT EXISTS / IF EXISTS — safe to re-run on restart.
 """
 
 import logging
@@ -22,15 +22,10 @@ from .config import settings
 
 logger = logging.getLogger(__name__)
 
-# ── Connection pool ──────────────────────────────────────────────────────────
-# A pool reuses connections instead of opening a new socket per query.
-# minconn=1: always keep 1 connection alive
-# maxconn=10: never open more than 10 simultaneous connections
 _pool: ThreadedConnectionPool | None = None
 
 
 def init_connection_pool() -> None:
-    """Initialise the PostgreSQL connection pool. Called on app startup."""
     global _pool
     _pool = ThreadedConnectionPool(
         minconn=1,
@@ -46,7 +41,6 @@ def init_connection_pool() -> None:
 
 
 def close_connection_pool() -> None:
-    """Close all connections in the pool. Called on app shutdown."""
     global _pool
     if _pool:
         _pool.closeall()
@@ -57,19 +51,12 @@ def close_connection_pool() -> None:
 @contextmanager
 def get_db() -> Generator:
     """
-    Context manager that yields a database connection from the pool.
+    Yield a database connection from the pool.
 
-    Usage:
-        with get_db() as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT 1")
-
-    Automatically returns the connection to the pool when done.
-    Rolls back on error; commits on success.
+    Commits on success, rolls back on error, always returns to pool.
     """
     if _pool is None:
-        raise RuntimeError("Connection pool not initialised. Call init_connection_pool() first.")
-
+        raise RuntimeError("Connection pool not initialised")
     conn = _pool.getconn()
     try:
         yield conn
@@ -81,7 +68,7 @@ def get_db() -> Generator:
         _pool.putconn(conn)
 
 
-# ── Schema ───────────────────────────────────────────────────────────────────
+# ── Schema ────────────────────────────────────────────────────────────────────
 
 _CREATE_PAPERS_TABLE = """
 CREATE TABLE IF NOT EXISTS papers (
@@ -89,31 +76,39 @@ CREATE TABLE IF NOT EXISTS papers (
     arxiv_id     VARCHAR(50) UNIQUE NOT NULL,
     title        TEXT NOT NULL,
     abstract     TEXT,
-    authors      TEXT[],          -- PostgreSQL native array; GIN-indexed
-    categories   TEXT[],          -- e.g. ['cs.LG', 'cs.CL']
+    authors      TEXT[],
+    categories   TEXT[],
     published_at TIMESTAMP WITH TIME ZONE,
+
+    -- PDF ingestion columns (added in arxiv-ingestion phase)
+    pdf_url      TEXT,
+    full_text    TEXT,
+    pdf_parsed   BOOLEAN DEFAULT FALSE,
+    parse_error  TEXT,
+
     created_at   TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
     updated_at   TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 """
 
 _CREATE_INDEXES = """
--- Fast lookup by arXiv ID (used in upsert logic)
 CREATE INDEX IF NOT EXISTS idx_papers_arxiv_id
     ON papers (arxiv_id);
 
--- GIN index for array containment queries:
---   WHERE 'cs.AI' = ANY(categories)
 CREATE INDEX IF NOT EXISTS idx_papers_categories
     ON papers USING GIN (categories);
 
--- Range queries on published date
 CREATE INDEX IF NOT EXISTS idx_papers_published_at
     ON papers (published_at DESC);
+
+-- Partial index: efficiently find papers still needing PDF parsing
+-- Only indexes rows where pdf_parsed=FALSE, so it stays small
+CREATE INDEX IF NOT EXISTS idx_papers_needs_parsing
+    ON papers (created_at DESC)
+    WHERE pdf_parsed = FALSE;
 """
 
-_CREATE_UPDATE_TRIGGER = """
--- Auto-update updated_at on any row change
+_CREATE_TRIGGER = """
 CREATE OR REPLACE FUNCTION update_updated_at_column()
 RETURNS TRIGGER AS $$
 BEGIN
@@ -132,22 +127,19 @@ CREATE TRIGGER update_papers_updated_at
 
 def init_schema() -> None:
     """
-    Create tables, indexes, and triggers if they don't exist.
+    Create or migrate the database schema.
 
-    Safe to call on every startup — all statements use IF NOT EXISTS.
+    Safe to call on every startup — all DDL uses IF NOT EXISTS.
     """
     with get_db() as conn:
         cursor = conn.cursor()
         cursor.execute(_CREATE_PAPERS_TABLE)
         cursor.execute(_CREATE_INDEXES)
-        cursor.execute(_CREATE_UPDATE_TRIGGER)
+        cursor.execute(_CREATE_TRIGGER)
         logger.info("Database schema initialised")
 
 
-# ── Health check ─────────────────────────────────────────────────────────────
-
 def check_health() -> dict:
-    """Return health status of the PostgreSQL connection."""
     try:
         with get_db() as conn:
             cursor = conn.cursor()
