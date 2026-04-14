@@ -1,8 +1,8 @@
 """
-arXiv RAG Curator — FastAPI application entry point.
+arXiv RAG Curator — FastAPI entry point.
 
-Updated to register the search router added in this phase.
-All other lifespan behaviour (DB pool, OpenSearch index init) is unchanged.
+Updated to register the hybrid search router and run chunk indexer setup
+on startup (creates chunks index + RRF pipeline if not already present).
 """
 
 import logging
@@ -18,6 +18,7 @@ from ..core.database import close_connection_pool, init_connection_pool, init_sc
 from ..core.search import check_health as os_health
 from ..core.search import init_index
 from .routers.search import router as search_router
+from .routers.hybrid_search import router as hybrid_router
 
 logging.basicConfig(
     level=logging.INFO,
@@ -30,11 +31,34 @@ logger = logging.getLogger(__name__)
 async def lifespan(app: FastAPI):
     logger.info("Starting arXiv RAG Curator API...")
 
+    # Core infrastructure
     init_connection_pool()
     init_schema()
-    init_index()
+    init_index()   # BM25 papers index
 
-    logger.info("All services initialised. API ready.")
+    # Chunk index + RRF pipeline (for hybrid search)
+    try:
+        from ..services.opensearch.factory import make_opensearch_client
+        from ..services.embeddings.factory import make_embeddings_service
+        from ..services.opensearch.chunk_indexer import ChunkIndexer
+        from ..core.database import get_db
+
+        indexer = ChunkIndexer(
+            os_client      = make_opensearch_client(),
+            embeddings_svc = make_embeddings_service(),
+            db             = get_db,
+        )
+        indexer.setup()   # creates chunks index + RRF pipeline if absent
+        logger.info("Chunk indexer setup complete")
+    except Exception as exc:
+        logger.warning("Chunk indexer setup failed (hybrid search may not work): %s", exc)
+
+    if settings.jina_api_key:
+        logger.info("Jina API key detected — hybrid search enabled")
+    else:
+        logger.info("No Jina API key — hybrid search will fall back to BM25")
+
+    logger.info("API ready.")
     yield
 
     close_connection_pool()
@@ -45,9 +69,9 @@ app = FastAPI(
     title="arXiv RAG Curator API",
     description=(
         "Production RAG system for arXiv papers. "
-        "BM25 keyword search, semantic search, and LLM-powered Q&A."
+        "BM25 keyword search, hybrid semantic search, and LLM-powered Q&A."
     ),
-    version="0.2.0",
+    version="0.3.0",
     docs_url="/docs",
     redoc_url="/redoc",
     lifespan=lifespan,
@@ -62,19 +86,22 @@ app.add_middleware(
 )
 
 # ── Routers ───────────────────────────────────────────────────────────────────
+app.include_router(search_router)    # /api/v1/search  (BM25 on papers index)
+app.include_router(hybrid_router)    # /api/v1/hybrid-search (chunks index)
 
-app.include_router(search_router)
-
-# ── Root routes ───────────────────────────────────────────────────────────────
 
 @app.get("/")
 async def root():
     return {
-        "service": "arXiv RAG Curator",
-        "version": "0.2.0",
-        "docs":    "/docs",
-        "health":  "/health",
-        "search":  "/api/v1/search",
+        "service":       "arXiv RAG Curator",
+        "version":       "0.3.0",
+        "docs":          "/docs",
+        "endpoints": {
+            "bm25_search":   "/api/v1/search",
+            "hybrid_search": "/api/v1/hybrid-search",
+            "health":        "/health",
+        },
+        "hybrid_enabled": bool(settings.jina_api_key),
     }
 
 
@@ -89,17 +116,25 @@ async def health_check():
     except Exception as exc:
         ollama = {"status": "unhealthy", "error": str(exc)}
 
-    all_healthy = all(
+    embedding = {
+        "status":   "enabled" if settings.jina_api_key else "disabled",
+        "reason":   None if settings.jina_api_key else "JINA_API_KEY not set",
+        "fallback": "bm25",
+    }
+
+    all_critical = all(
         s["status"] == "healthy"
-        for s in [postgres, opensearch_, ollama]
+        for s in [postgres, opensearch_]
     )
 
     return {
-        "status": "healthy" if all_healthy else "degraded",
+        "status":   "healthy" if all_critical else "degraded",
+        "version":  "0.3.0",
         "services": {
-            "postgresql": postgres,
-            "opensearch": opensearch_,
-            "ollama":     ollama,
+            "postgresql":  postgres,
+            "opensearch":  opensearch_,
+            "ollama":      ollama,
+            "embeddings":  embedding,
         },
     }
 
